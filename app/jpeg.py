@@ -1,11 +1,13 @@
 from __future__ import annotations
+import os
+import tempfile
 from . import contract
 from . import exif as exif_mod
 from . import xmp as xmp_mod
 from .base import BaseHandler
-from .fields import FieldCollector, clean_plan
+from .fields import FieldCollector
 from .registry import register
-__all__ = ['JpegHandler', 'JpegStructureError', 'scan_jpeg', 'EXIF_SIG', 'XMP_SIG']
+__all__ = ['JpegHandler', 'JpegStructureError', 'scan_jpeg', 'strip_metadata_segments', 'EXIF_SIG', 'XMP_SIG']
 EXIF_SIG = b'Exif\x00\x00'
 XMP_SIG = b'http://ns.adobe.com/xap/1.0/\x00'
 TAG_DESC = 270
@@ -27,6 +29,9 @@ GPS_ALT = 6
 _STANDALONE = {1, 216, 217, *range(208, 216)}
 _SOF = {*range(192, 208)} - {196, 200, 204}
 _TRAILING = b'\x00\r\n\t '
+_STRIPPED_APP = set(range(225, 240)) - {226, 238}
+WARN_CLEAN_PARTIAL = 'clean_partial'
+WARN_CLEAN_NO_OUT = 'clean_no_out_path'
 
 class JpegStructureError(ValueError):
     pass
@@ -82,6 +87,112 @@ def scan_jpeg(data: bytes) -> tuple[bytes | None, bytes | None]:
     if not tail.endswith(b'\xff\xd9'):
         raise JpegStructureError('image data truncated: EOI marker (FFD9) not found at end of file')
     return (exif_block, xmp_block)
+
+def _segment_label(marker: int, body: bytes) -> str:
+    if marker == 254:
+        return 'COM'
+    if marker == 225 and body.startswith(EXIF_SIG):
+        return 'APP1/EXIF'
+    if marker == 225 and body.startswith(XMP_SIG):
+        return 'APP1/XMP'
+    if marker == 225:
+        return 'APP1'
+    if marker == 237:
+        return 'APP13/IPTC'
+    return f'APP{marker - 224}'
+
+def _frame_size(data: bytes) -> tuple[int, int] | None:
+    n = len(data)
+    i = 2
+    while i + 3 < n:
+        if data[i] != 255:
+            return None
+        k = i
+        while k < n and data[k] == 255:
+            k += 1
+        if k >= n:
+            return None
+        marker = data[k]
+        if marker in _STANDALONE:
+            i = k + 1
+            continue
+        length = int.from_bytes(data[k + 1:k + 3], 'big')
+        if length < 2:
+            return None
+        if marker in _SOF and k + 1 + length <= n:
+            body = data[k + 3:k + 1 + length]
+            if len(body) >= 5:
+                return (int.from_bytes(body[3:5], 'big'), int.from_bytes(body[1:3], 'big'))
+            return None
+        if marker == 218:
+            return None
+        i = k + 1 + length
+    return None
+
+def strip_metadata_segments(data: bytes) -> tuple[bytes, list[str]]:
+    scan_jpeg(data)
+    out = bytearray(data[:2])
+    removed: list[str] = []
+    n = len(data)
+    i = 2
+    while True:
+        if i >= n:
+            raise JpegStructureError(f'unexpected end of file at offset {i}')
+        if data[i] != 255:
+            raise JpegStructureError(f'stray byte 0x{data[i]:02x} at offset {i}: marker expected')
+        k = i
+        while k < n and data[k] == 255:
+            k += 1
+        if k >= n:
+            raise JpegStructureError('file ends inside marker')
+        marker = data[k]
+        if marker == 217:
+            out += data[i:]
+            break
+        if marker in _STANDALONE:
+            out += data[i:k + 1]
+            i = k + 1
+            continue
+        if k + 3 > n:
+            raise JpegStructureError(f'truncated segment header at offset {k}')
+        length = int.from_bytes(data[k + 1:k + 3], 'big')
+        if length < 2:
+            raise JpegStructureError(f'invalid segment length {length} at offset {k}')
+        seg_end = k + 1 + length
+        if seg_end > n:
+            raise JpegStructureError(f'truncated segment 0xFF{marker:02X}: needs {seg_end - k} bytes, only {n - k} left')
+        body = data[k + 3:seg_end]
+        if marker in _STRIPPED_APP or marker == 254:
+            removed.append(_segment_label(marker, body))
+        elif marker == 218:
+            out += data[i:]
+            break
+        else:
+            out += data[i:seg_end]
+        i = seg_end
+    return (bytes(out), removed)
+
+def _atomic_write(out_path: str, payload: bytes, mode_from: str | None=None) -> None:
+    directory = os.path.dirname(os.path.abspath(out_path)) or '.'
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix='.clean-', suffix='.tmp', dir=directory)
+    try:
+        with os.fdopen(fd, 'wb') as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        if mode_from is not None:
+            try:
+                os.chmod(tmp, os.stat(mode_from).st_mode & 511)
+            except OSError:
+                pass
+        os.replace(tmp, out_path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 def _exif_gps(ex: exif_mod.Exif) -> tuple[str | None, str | None]:
     lat = ex.get(GPS_LAT, exif_mod.IFD_GPS)
@@ -188,4 +299,45 @@ class JpegHandler(BaseHandler):
 
     def _clean(self, path: str, out_path=None):
         collector = self._collector(path)
-        return clean_plan(collector.fields(), collector.warnings, out_path)
+        before = {item['key']: item for item in collector.fields()}
+        warnings = list(collector.warnings)
+        if out_path is None:
+            warnings.append(f'{WARN_CLEAN_NO_OUT}: out_path не передан, очищенный файл не создан')
+            return (collector.fields(), warnings)
+        out = os.fspath(out_path)
+        if os.path.abspath(out) == os.path.abspath(os.fspath(path)):
+            raise ValueError('out_path совпадает с исходным файлом: оригинал не перезаписывается')
+        with open(path, 'rb') as fh:
+            data = fh.read()
+        cleaned, removed = strip_metadata_segments(data)
+        size_before = _frame_size(data)
+        size_after = _frame_size(cleaned)
+        if size_before is not None and size_after is not None and (size_before != size_after):
+            raise JpegStructureError(f'frame size changed by clean: {size_before} -> {size_after}')
+        _atomic_write(out, cleaned, mode_from=path)
+        try:
+            after = {item['key']: item for item in self._collector(out).fields()}
+        except JpegStructureError as exc:
+            try:
+                os.unlink(out)
+            except OSError:
+                pass
+            raise JpegStructureError(f'cleaned output is not a valid JPEG: {exc}') from exc
+        fields = []
+        still_present: list[str] = []
+        for key, label in contract.fields_for(self.format):
+            had = key in before
+            has = key in after
+            if had and has:
+                fields.append(contract.field(key, label, contract.FOUND, after[key]['value']))
+                still_present.append(key)
+            elif had:
+                fields.append(contract.field(key, label, contract.REMOVED, None))
+            elif has:
+                fields.append(contract.field(key, label, contract.FOUND, after[key]['value']))
+                still_present.append(f'{key}(появилось после очистки)')
+            else:
+                fields.append(contract.field(key, label, contract.NOT_FOUND, None))
+        if still_present:
+            warnings.append(f"{WARN_CLEAN_PARTIAL}: после очистки в файле остались целевые поля {', '.join(still_present)}; вырезано сегментов: {(', '.join(removed) if removed else 'нет')}")
+        return (fields, warnings)
